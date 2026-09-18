@@ -5,13 +5,13 @@
  * Actuating capability: POST /api/control <- {"state": 0|1}
  *
  * The C6-DevKitC-1's on-board LED is an addressable WS2812 on GPIO8, not a
- * plain GPIO, so it is driven through the led_strip API.
+  * plain GPIO, so it is driven through the GPIO API.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/data/json.h>
-#include <zephyr/drivers/led_strip.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/net/http/server.h>
 #include <zephyr/net/http/service.h>
 #include <zephyr/net/net_event.h>
@@ -22,14 +22,13 @@
 #include <zephyr/logging/log.h>
 
 #if !defined(CONFIG_WIFI) || !defined(CONFIG_HTTP_SERVER) || \
-	!defined(CONFIG_JSON_LIBRARY) || !defined(CONFIG_LED_STRIP)
-#error "TASK 1 is not done yet: add the four capability symbols to prj.conf. \
-The lab guide lists them under 'Which subsystems get built'."
+        !defined(CONFIG_JSON_LIBRARY)
+#error "TASK 1 is not done yet: add the required capability symbols to prj.conf."
 #endif
 
 LOG_MODULE_REGISTER(lab0_http, LOG_LEVEL_INF);
 
-static const struct device *const strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 
 static K_SEM_DEFINE(ipv4_ready, 0, 1);
 
@@ -46,12 +45,19 @@ static const struct json_obj_descr control_cmd_descr[] = {
 	JSON_OBJ_DESCR_PRIM(struct control_cmd, state, JSON_TOK_NUMBER),
 };
 
+static int led_init(void)
+{
+        if (!gpio_is_ready_dt(&led)) {
+                LOG_ERR("LED device not ready");
+                return -ENODEV;
+        }
+
+        return gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+}
+
 static void led_set(int on)
 {
-	/* TASK 2 - Actuating Capability.
-	 * Drive the WS2812 from `on`. Guide section 0 has the two lines you need.
-	 */
-	ARG_UNUSED(on);
+        gpio_pin_set_dt(&led, on);
 }
 
 /* --- Sensing capability -------------------------------------------------- */
@@ -64,16 +70,28 @@ static int sensor_handler(struct http_client_ctx *client, enum http_transaction_
 	static const struct http_header headers[] = {
 		{ .name = "Content-Type", .value = "application/json" },
 	};
+*
+	if (status != HTTP_SERVER_REQUEST_DATA_FINAL) {
+                return 0;
+        }
 
-	/* TASK 3 - Sensing Capability.
-	 * Return early unless status is HTTP_SERVER_REQUEST_DATA_FINAL, then put a
-	 * simulated 20.0-29.9 degC reading into `body` and fill response_ctx.
-	 * Guide section 3 lists the fields and explains the early return.
-	 */
-	ARG_UNUSED(body);
-	ARG_UNUSED(headers);
+        /* Simulated reading: 20.0 - 29.9 degC */
+        uint32_t tenths = 200 + (sys_rand32_get() % 100);
+        int len = snprintf(body, sizeof(body), "{\"temperature\": %u.%u}", tenths / 10,
+                           tenths % 10);
 
-	return 0;
+        LOG_INF("Telemetry requested, sent: %s", body);
+
+        response_ctx->status = HTTP_200_OK;
+        response_ctx->headers = headers;
+        response_ctx->header_count = ARRAY_SIZE(headers);
+        response_ctx->body = body;
+        response_ctx->body_len = len;
+        response_ctx->final_chunk = true;
+
+        return 0;
+
+
 }
 
 static struct http_resource_detail_dynamic sensor_resource_detail = {
@@ -111,16 +129,27 @@ static int control_handler(struct http_client_ctx *client, enum http_transaction
 	memcpy(payload + cursor, request_ctx->data, request_ctx->data_len);
 	cursor += request_ctx->data_len;
 
-	if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
-		/* TASK 4 - Actuating Capability, application side.
-		 * `payload` holds `cursor` bytes of JSON; the accumulation above is
-		 * done for you. Parse it, drive led_set(), reset cursor, and answer
-		 * with ok_body. Guide section 4 covers the json_obj_parse return value.
-		 */
-		ARG_UNUSED(ok_body);
-		ARG_UNUSED(headers);
-		cursor = 0;
-	}
+	        if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
+                struct control_cmd cmd = { 0 };
+                int ret = json_obj_parse(payload, cursor, control_cmd_descr,
+                                         ARRAY_SIZE(control_cmd_descr), &cmd);
+
+                if (ret == BIT_MASK(ARRAY_SIZE(control_cmd_descr))) {
+                        LOG_INF("Actuating command received, LED state: %d", cmd.state);
+                        led_set(cmd.state);
+                } else {
+                        LOG_WRN("Could not parse control payload (ret %d)", ret);
+                }
+
+                cursor = 0;
+
+                response_ctx->status = HTTP_200_OK;
+                response_ctx->headers = headers;
+                response_ctx->header_count = ARRAY_SIZE(headers);
+                response_ctx->body = ok_body;
+                response_ctx->body_len = sizeof(ok_body) - 1;
+                response_ctx->final_chunk = true;
+        }
 
 	return 0;
 }
@@ -206,10 +235,10 @@ static int wifi_connect(void)
 
 int main(void)
 {
-	if (!device_is_ready(strip)) {
-		LOG_ERR("LED strip device not ready");
-		return -ENODEV;
+	if (led_init() != 0) {
+                return -ENODEV;
 	}
+
 	led_set(0);
 
 	net_mgmt_init_event_callback(&wifi_cb, wifi_event_handler,
